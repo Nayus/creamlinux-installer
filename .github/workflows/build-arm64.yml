@@ -13,6 +13,9 @@
 #     (self-contained, no host library requirements); the workflow_dispatch
 #     input "bundle-webkit" can be set to false to go back to relying on the
 #     host's system libraries (upstream v1.7.1 behavior, avoids UI freezes)
+#   - AppRun is wrapped (input "inject-dmabuf-disable", default on) to export
+#     WEBKIT_DISABLE_DMABUF_RENDERER=1: the AppImage then runs with a
+#     double-click on Fedora arm64 instead of showing a white screen
 #   - latest.json gains linux-aarch64 platform entries
 #
 # Manual trigger: Actions -> "Build and Release (ARM64)" -> Run workflow.
@@ -25,6 +28,10 @@ on:
     inputs:
       bundle-webkit:
         description: 'Bundle WebKitGTK/GTK/GLib inside the AppImage (self-contained). Uncheck to rely on host system libraries instead (upstream v1.7.1 behavior)'
+        type: boolean
+        default: true
+      inject-dmabuf-disable:
+        description: 'Patch the AppImage AppRun to export WEBKIT_DISABLE_DMABUF_RENDERER=1 so it runs with a double-click (fixes white screen on Fedora arm64)'
         type: boolean
         default: true
 
@@ -149,6 +156,35 @@ jobs:
         run: |
           npm run tauri build -- \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # Bake the white-screen fix into the AppImage itself: replace AppRun
+      # with a wrapper that exports WEBKIT_DISABLE_DMABUF_RENDERER=1 before
+      # exec'ing the real binary. Double-click (or direct exec) then works on
+      # Fedora arm64 without any terminal env vars. Repacks with
+      # appimagetool-aarch64 on the native arm64 runner.
+      - name: Inject WEBKIT_DISABLE_DMABUF_RENDERER=1 into AppImage AppRun
+        if: ${{ github.event.inputs.inject-dmabuf-disable == 'true' }}
+        run: |
+          set -euo pipefail
+          cd src-tauri/target/release/bundle/appimage
+          APPIMAGE=$(ls *.AppImage)
+          chmod +x "$APPIMAGE"
+          ./"$APPIMAGE" --appimage-extract >/dev/null
+          rm -f squashfs-root/AppRun
+          cat > squashfs-root/AppRun <<'APPRUN_EOF'
+          #!/bin/sh
+          # White-screen fix for Fedora arm64: bundled WebKitGTK vs Mesa/GPU
+          # driver mismatch. See the ARM64 build guide, troubleshooting section.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          : "${APPDIR:=$(dirname "$(readlink -f "$0")")}"
+          exec "${APPDIR}/usr/bin/creamlinux" "$@"
+          APPRUN_EOF
+          chmod +x squashfs-root/AppRun
+          curl -sSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
+          chmod +x appimagetool
+          rm -f "$APPIMAGE"
+          ARCH=aarch64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
+          rm -rf squashfs-root appimagetool
 
       # Optional: strip the bundled GTK/WebKit/GLib stack so the AppImage
       # relies on the host's own libraries. Skipped by default (bundle-webkit
