@@ -1,0 +1,274 @@
+# ARM64 (aarch64) build & release for creamlinux-installer
+#
+# Runs on GitHub-hosted ARM64 runners (ubuntu-24.04-arm, public preview).
+# Everything is native aarch64: Rust, WebKitGTK and the bundlers all run
+# without emulation, and the produced .deb/.rpm/AppImage are true arm64.
+#
+# Changes vs. upstream .github/workflows/build.yml:
+#   - runner: ubuntu-24.04-arm
+#   - no pinned libwebkit2gtk versions (those pins were x86_64-specific)
+#   - no TAURI_SIGNING_* secrets; updater artifact creation is disabled via
+#     --config (same trick the project's own package.nix uses)
+#   - AppImage keeps the WebKitGTK/GTK/GLib stack bundled by default
+#     (self-contained, no host library requirements); the workflow_dispatch
+#     input "bundle-webkit" can be set to false to go back to relying on the
+#     host's system libraries (upstream v1.7.1 behavior, avoids UI freezes)
+#   - latest.json gains linux-aarch64 platform entries
+#
+# Manual trigger: Actions -> "Build and Release (ARM64)" -> Run workflow.
+# Also un-drafts the release when done.
+
+name: 'Build and Release (ARM64)'
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle-webkit:
+        description: 'Bundle WebKitGTK/GTK/GLib inside the AppImage (self-contained). Uncheck to rely on host system libraries instead (upstream v1.7.1 behavior)'
+        type: boolean
+        default: true
+
+jobs:
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    outputs:
+      release_id: ${{ steps.create-release.outputs.result }}
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: setup node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+
+      - name: get version
+        id: get-version
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Package version: $VERSION"
+
+      - name: get changelog notes for version
+        id: changelog
+        env:
+          VERSION: ${{ steps.get-version.outputs.version }}
+        run: |
+          NOTES="$(awk -v ver="$VERSION" '
+            BEGIN { found=0 }
+            $0 ~ "^## \\[" ver "\\] - " { found=1 }
+            found {
+              if ($0 ~ "^## \\[" && $0 !~ "^## \\[" ver "\\] - " ) exit
+              print
+            }
+          ' CHANGELOG.md)"
+
+          if [ -z "$NOTES" ]; then
+            echo "No changelog entry found for version $VERSION" >&2
+            exit 1
+          fi
+
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: create draft release
+        id: create-release
+        uses: actions/github-script@v7
+        env:
+          VERSION: ${{ steps.get-version.outputs.version }}
+          NOTES: ${{ steps.changelog.outputs.notes }}
+        with:
+          script: |
+            // "-arm64" suffix avoids colliding with upstream tags when the
+            // fork later pulls from the original repository.
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${process.env.VERSION}-arm64`,
+              name: `v${process.env.VERSION}-arm64`,
+              body: process.env.NOTES,
+              draft: true,
+              prerelease: false
+            })
+            return data.id
+
+  build-tauri-arm64:
+    needs: create-release
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: 'npm'
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target'
+
+      - name: Install system dependencies (Ubuntu arm64)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libjavascriptcoregtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            pkg-config
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app (aarch64, no updater signing)
+        env:
+          NO_STRIP: 'true'
+        run: |
+          npm run tauri build -- \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      # Optional: strip the bundled GTK/WebKit/GLib stack so the AppImage
+      # relies on the host's own libraries. Skipped by default (bundle-webkit
+      # input defaults to true), which keeps WebKitGTK bundled inside.
+      - name: Strip bundled GTK/WebKit/GLib stack, rely on the host's instead
+        if: ${{ github.event.inputs.bundle-webkit == 'false' }}
+        run: |
+          set -euo pipefail
+          cd src-tauri/target/release/bundle/appimage
+          APPIMAGE=$(ls *.AppImage)
+          chmod +x "$APPIMAGE"
+          ./"$APPIMAGE" --appimage-extract >/dev/null
+
+          LDCONFIG_CACHE=$(ldconfig -p)
+          resolve_lib_path() {
+            awk -v lib="$1" '$1==lib {print $NF; exit}' <<< "$LDCONFIG_CACHE"
+          }
+
+          # WebKitGTK bundled by the AppImage tooling is pinned to whatever the
+          # build image ships, and drifts out of sync with newer host systems.
+          # Defer the whole GTK/WebKit/GLib stack to the host's own libraries.
+          declare -A EXCLUDE
+          for seed in libwebkit2gtk-4.1.so.0 libglib-2.0.so.0 libgio-2.0.so.0 libgobject-2.0.so.0 libgmodule-2.0.so.0; do
+            EXCLUDE[$seed]=1
+          done
+
+          changed=1
+          while [ "$changed" -eq 1 ]; do
+            changed=0
+            for lib in "${!EXCLUDE[@]}"; do
+              hostpath=$(resolve_lib_path "$lib")
+              [ -n "$hostpath" ] && [ -e "$hostpath" ] || continue
+              deps=$(ldd "$hostpath" 2>/dev/null | grep -oE '[a-zA-Z0-9._+-]+\.so[0-9.]*' | sort -u) || true
+              for d in $deps; do
+                if [ -z "${EXCLUDE[$d]:-}" ]; then
+                  if find squashfs-root/usr/lib -maxdepth 1 -name "${d}*" 2>/dev/null | grep -q .; then
+                    EXCLUDE[$d]=1
+                    changed=1
+                  fi
+                fi
+              done
+            done
+          done
+
+          echo "Excluding ${#EXCLUDE[@]} bundled libraries, relying on the host's instead:"
+          for lib in "${!EXCLUDE[@]}"; do echo "  $lib"; done | sort
+
+          for lib in "${!EXCLUDE[@]}"; do
+            find squashfs-root/usr/lib -maxdepth 1 -name "${lib%.so*}.so*" -delete
+          done
+
+          curl -sSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
+          chmod +x appimagetool
+          rm -f "$APPIMAGE"
+          ARCH=aarch64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
+          rm -rf squashfs-root appimagetool
+
+      - name: Upload artifacts to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.create-release.outputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd src-tauri/target/release/bundle
+
+          APPIMAGE_PATH=$(ls appimage/*.AppImage)
+          DEB_PATH=$(ls deb/*.deb)
+          RPM_PATH=$(ls rpm/*.rpm)
+
+          APPIMAGE_NAME=$(basename "$APPIMAGE_PATH")
+          DEB_NAME=$(basename "$DEB_PATH")
+          RPM_NAME=$(basename "$RPM_PATH")
+
+          # No signing key in a fork, so signatures are empty: the updater
+          # plugin will simply never verify a payload and auto-update stays
+          # disabled. Manual install from these artifacts works normally.
+          jq -n \
+            --arg version "$VERSION" \
+            --arg pub_date "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+            --arg appimage_url "https://github.com/$REPO/releases/latest/download/$APPIMAGE_NAME" \
+            --arg deb_url "https://github.com/$REPO/releases/latest/download/$DEB_NAME" \
+            --arg rpm_url "https://github.com/$REPO/releases/latest/download/$RPM_NAME" \
+            '{
+              version: $version,
+              notes: "",
+              pub_date: $pub_date,
+              platforms: {
+                "linux-aarch64": { signature: "", url: $appimage_url },
+                "linux-aarch64-appimage": { signature: "", url: $appimage_url },
+                "linux-aarch64-deb": { signature: "", url: $deb_url },
+                "linux-aarch64-rpm": { signature: "", url: $rpm_url }
+              }
+            }' > latest.json
+
+          gh release upload "v${VERSION}-arm64" \
+            "$APPIMAGE_PATH" \
+            "$DEB_PATH" \
+            "$RPM_PATH" \
+            latest.json \
+            --clobber \
+            --repo "$REPO"
+
+  publish-release:
+    name: Publish release
+    needs: [create-release, build-tauri-arm64]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Publish GitHub release (unset draft)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const release_id = Number("${{ needs.create-release.outputs.release_id }}");
+
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id,
+              draft: false
+            })
