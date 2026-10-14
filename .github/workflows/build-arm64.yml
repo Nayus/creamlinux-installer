@@ -9,13 +9,13 @@
 #   - no pinned libwebkit2gtk versions (those pins were x86_64-specific)
 #   - no TAURI_SIGNING_* secrets; updater artifact creation is disabled via
 #     --config (same trick the project's own package.nix uses)
-#   - AppImage keeps the WebKitGTK/GTK/GLib stack bundled by default
-#     (self-contained, no host library requirements); the workflow_dispatch
-#     input "bundle-webkit" can be set to false to go back to relying on the
-#     host's system libraries (upstream v1.7.1 behavior, avoids UI freezes)
-#   - AppRun is wrapped (input "inject-dmabuf-disable", default on) to export
-#     WEBKIT_DISABLE_DMABUF_RENDERER=1: the AppImage then runs with a
-#     double-click on Fedora arm64 instead of showing a white screen
+#   - AppImage keeps the WebKitGTK/GTK/GLib stack bundled by default.
+#     Host kernel, libc, graphics drivers and desktop services still matter.
+#     "bundle-webkit=false" selects upstream's host-library mode (experimental
+#     here; not a verified Fedora fix).
+#   - Preserve original AppRun and wrap it to export the DMA-BUF workaround.
+#     This keeps GTK hooks, library paths and the original working directory;
+#     Fedora GUI compatibility still needs testing on the user's device.
 #   - latest.json gains linux-aarch64 platform entries
 #
 # Manual trigger: Actions -> "Build and Release (ARM64)" -> Run workflow.
@@ -27,11 +27,11 @@ on:
   workflow_dispatch:
     inputs:
       bundle-webkit:
-        description: 'Bundle WebKitGTK/GTK/GLib inside the AppImage (self-contained). Uncheck to rely on host system libraries instead (upstream v1.7.1 behavior)'
+        description: 'Keep bundled WebKitGTK/GTK/GLib (recommended for this build). Uncheck for experimental host-library mode'
         type: boolean
         default: true
       inject-dmabuf-disable:
-        description: 'Patch the AppImage AppRun to export WEBKIT_DISABLE_DMABUF_RENDERER=1 so it runs with a double-click (fixes white screen on Fedora arm64)'
+        description: 'Wrap original AppRun and export WEBKIT_DISABLE_DMABUF_RENDERER=1 (renderer workaround; not a guaranteed white-screen fix)'
         type: boolean
         default: true
 
@@ -93,18 +93,30 @@ jobs:
           NOTES: ${{ steps.changelog.outputs.notes }}
         with:
           script: |
-            // "-arm64" suffix avoids colliding with upstream tags when the
-            // fork later pulls from the original repository.
+            // Reuse the release so rebuilding this version does not fail with
+            // "already_exists". Upload uses --clobber below.
+            const tag = `v${process.env.VERSION}-arm64`;
+            try {
+              const { data } = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag
+              });
+              return data.id;
+            } catch (error) {
+              if (error.status !== 404) throw error;
+            }
             const { data } = await github.rest.repos.createRelease({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              tag_name: `v${process.env.VERSION}-arm64`,
-              name: `v${process.env.VERSION}-arm64`,
+              tag_name: tag,
+              target_commitish: context.sha,
+              name: tag,
               body: process.env.NOTES,
               draft: true,
               prerelease: false
-            })
-            return data.id
+            });
+            return data.id;
 
   build-tauri-arm64:
     needs: create-release
@@ -157,34 +169,68 @@ jobs:
           npm run tauri build -- \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      # Bake the white-screen fix into the AppImage itself: replace AppRun
-      # with a wrapper that exports WEBKIT_DISABLE_DMABUF_RENDERER=1 before
-      # exec'ing the real binary. Double-click (or direct exec) then works on
-      # Fedora arm64 without any terminal env vars. Repacks with
-      # appimagetool-aarch64 on the native arm64 runner.
-      - name: Inject WEBKIT_DISABLE_DMABUF_RENDERER=1 into AppImage AppRun
+      # Keep the complete linuxdeploy startup chain, GTK hooks and its chdir
+      # into AppDir/usr. WebKit's patched relative helper paths need that cwd.
+      # The renderer flag is a workaround, NOT a Fedora compatibility guarantee.
+      - name: Wrap original AppRun with DMA-BUF workaround
         if: ${{ github.event.inputs.inject-dmabuf-disable == 'true' }}
         run: |
           set -euo pipefail
-          cd src-tauri/target/release/bundle/appimage
-          APPIMAGE=$(ls *.AppImage)
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          [[ ${#images[@]} -eq 1 ]] || { echo 'Expected exactly one AppImage'; exit 1; }
+          APPIMAGE=$(realpath "${images[0]}")
           chmod +x "$APPIMAGE"
-          ./"$APPIMAGE" --appimage-extract >/dev/null
-          rm -f squashfs-root/AppRun
-          cat > squashfs-root/AppRun <<'APPRUN_EOF'
+          WORK_DIR=$(mktemp -d)
+          cd "$WORK_DIR"
+          "$APPIMAGE" --appimage-extract >/dev/null
+          APPDIR_PATH=$(realpath squashfs-root)
+
+          # Verify the exact source/destination before moving the launcher.
+          [[ "$APPDIR_PATH" == "$WORK_DIR/squashfs-root" ]]
+          test -x "$APPDIR_PATH/AppRun"
+          test ! -e "$APPDIR_PATH/AppRun.original"
+          test ! -L "$APPDIR_PATH/AppRun.original"
+          printf 'Preserve %s as %s\n' "$APPDIR_PATH/AppRun" "$APPDIR_PATH/AppRun.original"
+          mv -- "$APPDIR_PATH/AppRun" "$APPDIR_PATH/AppRun.original"
+          cat > "$APPDIR_PATH/AppRun" <<'APPRUN_EOF'
           #!/bin/sh
-          # White-screen fix for Fedora arm64: bundled WebKitGTK vs Mesa/GPU
-          # driver mismatch. See the ARM64 build guide, troubleshooting section.
+          # Only inject the workaround; the original launcher sets up the app.
+          export APPDIR="${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)}"
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
-          : "${APPDIR:=$(dirname "$(readlink -f "$0")")}"
-          exec "${APPDIR}/usr/bin/creamlinux" "$@"
+          exec "$APPDIR/AppRun.original" "$@"
           APPRUN_EOF
-          chmod +x squashfs-root/AppRun
-          curl -sSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
+          chmod +x "$APPDIR_PATH/AppRun"
+          sh -n "$APPDIR_PATH/AppRun"
+
+          # Preserve the original runtime rather than silently upgrading it.
+          # gzip is also understood by older type-2 runtimes.
+          OFFSET=$("$APPIMAGE" --appimage-offset)
+          [[ "$OFFSET" =~ ^[0-9]+$ ]] && (( OFFSET > 0 ))
+          dd if="$APPIMAGE" of=runtime bs=64K iflag=count_bytes count="$OFFSET" status=none
+          curl -fSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
           chmod +x appimagetool
-          rm -f "$APPIMAGE"
-          ARCH=aarch64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
-          rm -rf squashfs-root appimagetool
+          ARCH=aarch64 ./appimagetool --appimage-extract-and-run \
+            --runtime-file "$WORK_DIR/runtime" --comp gzip \
+            "$APPDIR_PATH" "$WORK_DIR/repacked.AppImage"
+
+          # Inspect the repacked file, not just the input AppDir. Keep the old
+          # image until repacking and launcher verification both succeed.
+          mkdir verify
+          cd verify
+          "$WORK_DIR/repacked.AppImage" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun.original
+          sh -n squashfs-root/AppRun
+          cmp "$APPDIR_PATH/AppRun" squashfs-root/AppRun
+          cmp "$APPDIR_PATH/AppRun.original" squashfs-root/AppRun.original
+          if [ -e "$APPDIR_PATH/AppRun.wrapped" ]; then
+            cmp "$APPDIR_PATH/AppRun.wrapped" squashfs-root/AppRun.wrapped
+          fi
+          if [ -d "$APPDIR_PATH/apprun-hooks" ]; then
+            diff -r "$APPDIR_PATH/apprun-hooks" squashfs-root/apprun-hooks
+          fi
+          cp "$WORK_DIR/repacked.AppImage" "$APPIMAGE"
+          chmod +x "$APPIMAGE"
 
       # Optional: strip the bundled GTK/WebKit/GLib stack so the AppImage
       # relies on the host's own libraries. Skipped by default (bundle-webkit
@@ -193,10 +239,15 @@ jobs:
         if: ${{ github.event.inputs.bundle-webkit == 'false' }}
         run: |
           set -euo pipefail
-          cd src-tauri/target/release/bundle/appimage
-          APPIMAGE=$(ls *.AppImage)
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          [[ ${#images[@]} -eq 1 ]] || { echo 'Expected exactly one AppImage'; exit 1; }
+          APPIMAGE=$(realpath "${images[0]}")
           chmod +x "$APPIMAGE"
-          ./"$APPIMAGE" --appimage-extract >/dev/null
+          WORK_DIR=$(mktemp -d)
+          cd "$WORK_DIR"
+          "$APPIMAGE" --appimage-extract >/dev/null
+          [[ "$(realpath squashfs-root/usr/lib)" == "$WORK_DIR/squashfs-root/usr/lib" ]]
 
           LDCONFIG_CACHE=$(ldconfig -p)
           resolve_lib_path() {
@@ -236,11 +287,67 @@ jobs:
             find squashfs-root/usr/lib -maxdepth 1 -name "${lib%.so*}.so*" -delete
           done
 
-          curl -sSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
+          OFFSET=$("$APPIMAGE" --appimage-offset)
+          [[ "$OFFSET" =~ ^[0-9]+$ ]] && (( OFFSET > 0 ))
+          dd if="$APPIMAGE" of=runtime bs=64K iflag=count_bytes count="$OFFSET" status=none
+          curl -fSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
           chmod +x appimagetool
-          rm -f "$APPIMAGE"
-          ARCH=aarch64 ./appimagetool --appimage-extract-and-run squashfs-root "$APPIMAGE"
-          rm -rf squashfs-root appimagetool
+          ARCH=aarch64 ./appimagetool --appimage-extract-and-run \
+            --runtime-file "$WORK_DIR/runtime" --comp gzip \
+            squashfs-root "$WORK_DIR/repacked.AppImage"
+          cp "$WORK_DIR/repacked.AppImage" "$APPIMAGE"
+          chmod +x "$APPIMAGE"
+
+      # Structural checks only; this is NOT a Fedora GUI smoke test.
+      - name: Inspect final AppImage architecture and startup files
+        env:
+          BUNDLE_WEBKIT: ${{ github.event.inputs.bundle-webkit }}
+          INJECT_DMABUF_DISABLE: ${{ github.event.inputs.inject-dmabuf-disable }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          [[ ${#images[@]} -eq 1 ]] || { echo 'Expected exactly one AppImage'; exit 1; }
+          APPIMAGE=$(realpath "${images[0]}")
+          cd "$(mktemp -d)"
+          "$APPIMAGE" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path('squashfs-root')
+
+          def require_arm64(path):
+              header = path.read_bytes()[:20]
+              if header[:4] != b'\x7fELF' or header[5] != 1 or int.from_bytes(header[18:20], 'little') != 183:
+                  raise RuntimeError(f'Expected AArch64 ELF: {path}')
+              if not os.access(path, os.X_OK):
+                  raise RuntimeError(f'Not executable: {path}')
+              print(f'AArch64 executable: {path}')
+
+          require_arm64(root / 'usr/bin/creamlinux')
+          if (root / 'AppRun.wrapped').exists():
+              require_arm64(root / 'AppRun.wrapped')
+          if os.environ['INJECT_DMABUF_DISABLE'] == 'true':
+              assert os.access(root / 'AppRun.original', os.X_OK), 'Missing original launcher'
+              wrapper = (root / 'AppRun').read_text()
+              assert 'exec "$APPDIR/AppRun.original" "$@"' in wrapper, 'Original launcher is bypassed'
+              assert 'export WEBKIT_DISABLE_DMABUF_RENDERER=1' in wrapper, 'Missing workaround'
+          if os.environ['BUNDLE_WEBKIT'] == 'true':
+              for pattern in ('libwebkit2gtk-4.1.so*', 'libjavascriptcoregtk-4.1.so*', 'libglib-2.0.so*', 'libwebkit2gtkinjectedbundle.so'):
+                  paths = [p for p in root.rglob(pattern) if p.is_file()]
+                  if not paths:
+                      raise RuntimeError(f'Missing bundled WebKit stack: {pattern}')
+                  print(f'Bundled {pattern}: {paths}')
+              for name in ('WebKitWebProcess', 'WebKitNetworkProcess'):
+                  paths = [p for p in root.rglob(name) if p.is_file()]
+                  if not paths:
+                      raise RuntimeError(f'Missing WebKit subprocess: {name}')
+                  for path in paths:
+                      require_arm64(path)
+          print('Structure checks passed; Fedora desktop execution remains untested.')
+          PY
 
       - name: Upload artifacts to release
         env:
