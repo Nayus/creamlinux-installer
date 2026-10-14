@@ -204,14 +204,15 @@ jobs:
           sh -n "$APPDIR_PATH/AppRun"
 
           # Preserve the original runtime rather than silently upgrading it.
-          # gzip is also understood by older type-2 runtimes.
+          # Current appimagetool bundles a zstd-only mksquashfs. Verify below
+          # that the original runtime can extract the resulting zstd image.
           OFFSET=$("$APPIMAGE" --appimage-offset)
           [[ "$OFFSET" =~ ^[0-9]+$ ]] && (( OFFSET > 0 ))
           dd if="$APPIMAGE" of=runtime bs=64K iflag=count_bytes count="$OFFSET" status=none
           curl -fSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
           chmod +x appimagetool
           ARCH=aarch64 ./appimagetool --appimage-extract-and-run \
-            --runtime-file "$WORK_DIR/runtime" --comp gzip \
+            --runtime-file "$WORK_DIR/runtime" --comp zstd \
             "$APPDIR_PATH" "$WORK_DIR/repacked.AppImage"
 
           # Inspect the repacked file, not just the input AppDir. Keep the old
@@ -293,7 +294,7 @@ jobs:
           curl -fSL -o appimagetool "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-aarch64.AppImage"
           chmod +x appimagetool
           ARCH=aarch64 ./appimagetool --appimage-extract-and-run \
-            --runtime-file "$WORK_DIR/runtime" --comp gzip \
+            --runtime-file "$WORK_DIR/runtime" --comp zstd \
             squashfs-root "$WORK_DIR/repacked.AppImage"
           cp "$WORK_DIR/repacked.AppImage" "$APPIMAGE"
           chmod +x "$APPIMAGE"
