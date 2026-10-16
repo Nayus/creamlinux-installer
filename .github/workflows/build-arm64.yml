@@ -9,7 +9,9 @@
 #   - no pinned libwebkit2gtk versions (those pins were x86_64-specific)
 #   - no TAURI_SIGNING_* secrets; updater artifact creation is disabled via
 #     --config (same trick the project's own package.nix uses)
-#   - AppImage keeps the WebKitGTK/GTK/GLib stack bundled by default.
+#   - AppImage keeps the WebKitGTK/GTK/GLib stack bundled by default,
+#     but always uses host Wayland libraries with host Mesa/EGL drivers.
+#     This fixes wl_fixes_interface lookup failures on newer Fedora systems.
 #     Host kernel, libc, graphics drivers and desktop services still matter.
 #     "bundle-webkit=false" selects upstream's host-library mode (experimental
 #     here; not a verified Fedora fix).
@@ -169,11 +171,15 @@ jobs:
           npm run tauri build -- \
             --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      # Keep the complete linuxdeploy startup chain, GTK hooks and its chdir
-      # into AppDir/usr. WebKit's patched relative helper paths need that cwd.
-      # The renderer flag is a workaround, NOT a Fedora compatibility guarantee.
-      - name: Wrap original AppRun with DMA-BUF workaround
-        if: ${{ github.event.inputs.inject-dmabuf-disable == 'true' }}
+      - name: Test AppImage Wayland policy
+        run: python3 -m unittest discover -s scripts -p 'test_appimage_wayland.py' -v
+
+      # Host Mesa must use host Wayland: bundled Ubuntu Wayland lacks symbols
+      # such as wl_fixes_interface required by newer Mesa/EGL drivers.
+      # Cleanup/repacking is unconditional; only the renderer flag is optional.
+      - name: Repack AppImage with host Wayland and original startup chain
+        env:
+          INJECT_DMABUF_DISABLE: ${{ github.event.inputs.inject-dmabuf-disable }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -186,22 +192,26 @@ jobs:
           "$APPIMAGE" --appimage-extract >/dev/null
           APPDIR_PATH=$(realpath squashfs-root)
 
-          # Verify the exact source/destination before moving the launcher.
+          # Remove ONLY the four Wayland families, never WebKit/GTK/GLib.
           [[ "$APPDIR_PATH" == "$WORK_DIR/squashfs-root" ]]
+          python3 "$GITHUB_WORKSPACE/scripts/appimage_wayland.py" strip "$APPDIR_PATH"
           test -x "$APPDIR_PATH/AppRun"
-          test ! -e "$APPDIR_PATH/AppRun.original"
-          test ! -L "$APPDIR_PATH/AppRun.original"
-          printf 'Preserve %s as %s\n' "$APPDIR_PATH/AppRun" "$APPDIR_PATH/AppRun.original"
-          mv -- "$APPDIR_PATH/AppRun" "$APPDIR_PATH/AppRun.original"
-          cat > "$APPDIR_PATH/AppRun" <<'APPRUN_EOF'
+          if [[ "$INJECT_DMABUF_DISABLE" == 'true' ]]; then
+            # Preserve same-root AppRun, GTK hooks, chdir and helper lookup.
+            test ! -e "$APPDIR_PATH/AppRun.original"
+            test ! -L "$APPDIR_PATH/AppRun.original"
+            printf 'Preserve %s as %s\n' "$APPDIR_PATH/AppRun" "$APPDIR_PATH/AppRun.original"
+            mv -- "$APPDIR_PATH/AppRun" "$APPDIR_PATH/AppRun.original"
+            cat > "$APPDIR_PATH/AppRun" <<'APPRUN_EOF'
           #!/bin/sh
           # Only inject the workaround; the original launcher sets up the app.
           export APPDIR="${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)}"
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           exec "$APPDIR/AppRun.original" "$@"
           APPRUN_EOF
-          chmod +x "$APPDIR_PATH/AppRun"
-          sh -n "$APPDIR_PATH/AppRun"
+            chmod +x "$APPDIR_PATH/AppRun"
+            sh -n "$APPDIR_PATH/AppRun"
+          fi
 
           # Preserve the original runtime rather than silently upgrading it.
           # Current appimagetool bundles a zstd-only mksquashfs. Verify below
@@ -220,10 +230,14 @@ jobs:
           mkdir verify
           cd verify
           "$WORK_DIR/repacked.AppImage" --appimage-extract >/dev/null
-          test -x squashfs-root/AppRun.original
-          sh -n squashfs-root/AppRun
+          python3 "$GITHUB_WORKSPACE/scripts/appimage_wayland.py" check "$PWD/squashfs-root"
+          test -x squashfs-root/AppRun
           cmp "$APPDIR_PATH/AppRun" squashfs-root/AppRun
-          cmp "$APPDIR_PATH/AppRun.original" squashfs-root/AppRun.original
+          if [[ "$INJECT_DMABUF_DISABLE" == 'true' ]]; then
+            test -x squashfs-root/AppRun.original
+            sh -n squashfs-root/AppRun
+            cmp "$APPDIR_PATH/AppRun.original" squashfs-root/AppRun.original
+          fi
           if [ -e "$APPDIR_PATH/AppRun.wrapped" ]; then
             cmp "$APPDIR_PATH/AppRun.wrapped" squashfs-root/AppRun.wrapped
           fi
@@ -313,6 +327,7 @@ jobs:
           cd "$(mktemp -d)"
           "$APPIMAGE" --appimage-extract >/dev/null
           test -x squashfs-root/AppRun
+          python3 "$GITHUB_WORKSPACE/scripts/appimage_wayland.py" check "$PWD/squashfs-root"
           python3 - <<'PY'
           import os
           from pathlib import Path
@@ -336,7 +351,7 @@ jobs:
               assert 'exec "$APPDIR/AppRun.original" "$@"' in wrapper, 'Original launcher is bypassed'
               assert 'export WEBKIT_DISABLE_DMABUF_RENDERER=1' in wrapper, 'Missing workaround'
           if os.environ['BUNDLE_WEBKIT'] == 'true':
-              for pattern in ('libwebkit2gtk-4.1.so*', 'libjavascriptcoregtk-4.1.so*', 'libglib-2.0.so*', 'libwebkit2gtkinjectedbundle.so'):
+              for pattern in ('libwebkit2gtk-4.1.so*', 'libjavascriptcoregtk-4.1.so*', 'libglib-2.0.so*', 'libgtk-3.so*', 'libgdk-3.so*', 'libwebkit2gtkinjectedbundle.so'):
                   paths = [p for p in root.rglob(pattern) if p.is_file()]
                   if not paths:
                       raise RuntimeError(f'Missing bundled WebKit stack: {pattern}')
@@ -355,6 +370,8 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ needs.create-release.outputs.version }}
           REPO: ${{ github.repository }}
+          BUILD_SHA: ${{ github.sha }}
+          BUILD_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
           cd src-tauri/target/release/bundle
@@ -388,10 +405,31 @@ jobs:
               }
             }' > latest.json
 
+          # Same-version rebuilds replace assets: publish hashes/provenance so
+          # users can distinguish this host-Wayland fix from an older download.
+          python3 - <<'PY'
+          import hashlib
+          import os
+          from pathlib import Path
+          packages = [next(Path(folder).glob(pattern)) for folder, pattern in
+                      [('appimage', '*.AppImage'), ('deb', '*.deb'), ('rpm', '*.rpm')]]
+          with Path('SHA256SUMS').open('w') as out:
+              for path in packages:
+                  with path.open('rb') as package:
+                      digest = hashlib.file_digest(package, 'sha256').hexdigest()
+                  out.write(f'{digest}  {path.name}\n')
+          Path('ARM64-BUILD.txt').write_text(
+              f"Commit: {os.environ['BUILD_SHA']}\nRun: {os.environ['BUILD_URL']}\n"
+              'AppImage Wayland: host libraries (no bundled client/server/cursor/egl)\n'
+              'WebKitGTK/GTK/GLib: bundled by default\n')
+          PY
+
           gh release upload "v${VERSION}-arm64" \
             "$APPIMAGE_PATH" \
             "$DEB_PATH" \
             "$RPM_PATH" \
+            ARM64-BUILD.txt \
+            SHA256SUMS \
             latest.json \
             --clobber \
             --repo "$REPO"
